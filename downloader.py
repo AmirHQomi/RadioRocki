@@ -2,68 +2,109 @@ import os
 import re
 import asyncio
 import json
+import logging
+from datetime import datetime
+from pathlib import Path
+from tqdm import tqdm
 from telethon import TelegramClient
+from telethon.errors import FloodWaitError, RPCError
 
-# --------- تنظیمات API تلگرام ---------
-api_id = '26973577'  # باید از تلگرام API ID خود استفاده کنید
-api_hash = 'bf3596c4fbf3689f2df5d6c2c2428a4a'  # باید از تلگرام API Hash خود استفاده کنید
-channel_username = 'RadioRockie'  # نام کانال تلگرام
+# --------- Setup Logging ---------
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('telegram_downloader.log'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
 
-# مسیر ذخیره فایل‌ها
-save_path = 'downloaded_music'
-os.makedirs(save_path, exist_ok=True)
+# --------- Load Config ---------
+CONFIG = {
+    "api_id": "26973577",       # Your Telegram API ID
+    "api_hash": "bf3596c4fbf3689f2df5d6c2c2428a4a",     # Your Telegram API Hash
+    "channel": "RadioRockie",  # Target channel username
+    "download_path": "downloaded_music",
+    "session_file": "my_session",
+    "max_retries": 3,   # Retry failed downloads
+    "delay_between_downloads": 2  # Avoid rate limits (seconds)
+}
 
-# مسیر ذخیره سشن تلگرام
-session_name = 'my_session'
+# --------- Helper Functions ---------
+def clean_filename(filename: str) -> str:
+    """Remove invalid characters from filenames."""
+    return re.sub(r'[<>:"/\\|?*]', '', filename).strip()
 
-# --------- توابع کمکی ---------
-# تابع پاکسازی نام فایل
-def clean_filename(filename):
-    return re.sub(r'[<>:"/\\|?*]', '', filename)
+async def is_valid_mp3(file_path: str) -> bool:
+    """Check if file is a valid MP3 by reading its header."""
+    try:
+        with open(file_path, 'rb') as f:
+            header = f.read(3)
+            return header == b'ID3'  # MP3 files start with 'ID3'
+    except Exception:
+        return False
 
-# تابع دانلود فایل از تلگرام
-async def download_music(client):
-    downloaded_files = set(os.listdir(save_path))  # فایل‌هایی که قبلاً دانلود شده‌اند را بشناسیم
+# --------- Main Downloader ---------
+async def download_music(client: TelegramClient):
+    Path(CONFIG["download_path"]).mkdir(exist_ok=True)
+    downloaded_files = set(os.listdir(CONFIG["download_path"]))
     report = []
 
-    # وارد شدن به کانال و بررسی پیام‌ها
-    async for msg in client.iter_messages(channel_username):
-        if msg.file and msg.file.mime_type and 'audio' in msg.file.mime_type:
-            # بررسی اینکه آیا فایل قبلاً دانلود شده است یا نه
-            file_name = clean_filename(msg.file.name or f'{msg.id}.mp3')
-            full_path = os.path.join(save_path, file_name)
-
-            # اگر فایل قبلاً دانلود شده باشد، از دانلود دوباره آن خودداری می‌کنیم
-            if file_name in downloaded_files:
-                print(f'⚡ {file_name} already downloaded, skipping...')
+    try:
+        async for msg in client.iter_messages(CONFIG["channel"]):
+            if not (msg.file and msg.file.mime_type and 'audio' in msg.file.mime_type):
                 continue
 
-            print(f'Downloading: {file_name}')
-            try:
-                # دانلود فایل از تلگرام
-                await msg.download_media(file=full_path)
-                downloaded_files.add(file_name)
+            filename = clean_filename(msg.file.name or f"{msg.id}.mp3")
+            filepath = os.path.join(CONFIG["download_path"], filename)
 
-                # ثبت نام فایل در گزارش
-                report.append({
-                    'file_name': file_name,
-                    'download_path': full_path
-                })
-                print(f'✔ {file_name} downloaded successfully.')
+            if filename in downloaded_files:
+                logger.info(f"⏩ Already exists: {filename}")
+                continue
 
-            except Exception as e:
-                print(f'❌ Failed to download {file_name}: {e}')
+            for attempt in range(CONFIG["max_retries"]):
+                try:
+                    logger.info(f"⬇️ Downloading ({attempt + 1}/{CONFIG['max_retries']}): {filename}")
+                    await msg.download_media(file=filepath)
+                    
+                    if await is_valid_mp3(filepath):
+                        report.append({
+                            "file_name": filename,
+                            "size": f"{msg.file.size / (1024 * 1024):.2f} MB",
+                            "date": datetime.now().isoformat()
+                        })
+                        logger.info(f"✅ Success: {filename}")
+                        break
+                    else:
+                        os.remove(filepath)
+                        logger.error(f"❌ Invalid MP3: {filename}")
 
-    # ذخیره گزارش دانلودها در فایل JSON
-    with open('download_report.json', 'w') as f:
-        json.dump(report, f, indent=4)
-    print('✅ All files downloaded successfully.')
+                except FloodWaitError as e:
+                    logger.warning(f"⏳ Flood wait: {e.seconds} seconds")
+                    await asyncio.sleep(e.seconds)
+                except RPCError as e:
+                    logger.error(f"⚠️ Telegram error: {e}")
+                    await asyncio.sleep(CONFIG["delay_between_downloads"])
+                except Exception as e:
+                    logger.error(f"❌ Failed: {filename} - {str(e)}")
+                    await asyncio.sleep(CONFIG["delay_between_downloads"])
 
-# --------- اجرای کد دانلود ---------
+    finally:
+        with open("download_report.json", "w") as f:
+            json.dump(report, f, indent=4)
+        logger.info("📝 Download report saved.")
+
+# --------- Entry Point ---------
 async def main():
-    async with TelegramClient(session_name, api_id, api_hash) as client:
-        await download_music(client)
+    client = TelegramClient(
+        session=CONFIG["session_file"],
+        api_id=CONFIG["api_id"],
+        api_hash=CONFIG["api_hash"]
+    )
+    await client.start()
+    await download_music(client)
+    await client.disconnect()
 
-# اجرای اصلی برنامه
 if __name__ == "__main__":
     asyncio.run(main())
